@@ -440,7 +440,7 @@ static BOOL (*old__AFSecurityPolicy_policyWithPinningMode)(id cls, SEL _cmd, BOO
 static BOOL new__AFSecurityPolicy_policyWithPinningMode(id cls, SEL _cmd, BOOL mode) 
 HOOKBODY({
     SSKVerboseLog("AFSecurityPolicy policyWithPinningMode: %d -> AFSSLPinningModeNone", mode);
-    return old__AFSecurityPolicy_setAllowInvalidCertificates(cls, _cmd, 0); // AFSSLPinningModeNone
+    return old__AFSecurityPolicy_policyWithPinningMode(cls, _cmd, 0); // AFSSLPinningModeNone
 })
 
 static BOOL (*old__AFSecurityPolicy_policyWithPinningMode_withPinnedCertificates)(id cls, SEL _cmd, BOOL mode, id cert);
@@ -475,28 +475,15 @@ HOOKBODY({
 
 #include <ptrauth.h>
 
+// Decode an unconditional AArch64 "B imm26" at `pc`. Returns the branch target, or 0 if the instruction is not a plain B.
 static uint64_t parse_branch_instruction(uint32_t instruction, uint64_t pc) {
-    // parse B instruction
-    uint32_t opcode = (instruction >> 26) & 0x3F;
-    printf("%x\n", opcode);
-    uint32_t imm26 = instruction & 0x03FFFFFF;
-
-    // check if it's B instruction（opcode == 0b100101）
-    if (opcode != 0b000101) {
+    // B: 000101 | imm26   (BL is 100101 and must NOT be followed - it sets LR)
+    if ((instruction >> 26) != 0x05) {
         return 0;
     }
-
-    // calc target address
-    uint32_t sign_bit = imm26 >> 25;
-    uint64_t offset = (imm26 << 2) & 0x1FFFFFF;
-    uint64_t target_address = pc + offset;
-
-    // handle imm26 sign bit
-    if (sign_bit) {
-        target_address -= (1 << 25);
-    }
-
-    return target_address;
+    // sign-extend imm26 and scale by 4 (range is +/-128MB)
+    int64_t offset = ((int64_t)((int32_t)(instruction << 6))) >> 4;
+    return pc + offset;
 }
 
 void hookF(const char *libName, const char *funcName, void *replaceFun, void **origFun) {
@@ -522,7 +509,7 @@ void hookF(const char *libName, const char *funcName, void *replaceFun, void **o
         memcpy(originalMem, pIns, sizeof(originalMem));
         uintptr_t targetAddr = parse_branch_instruction(pIns[0], (uint64_t)pIns);
         if (targetAddr) {
-            SSKInfoLog("%{public}s jumps to %p: %llx, hook new addr instead!", funcName, targetAddr, *(void **)targetAddr);
+            SSKInfoLog("%{public}s jumps to %p, hook new addr instead!", funcName, (void *)targetAddr);
             pFunc = (void *)targetAddr;
         }
         // SSKVerboseLog("MSHookFunction(%p, %p, %p)");
@@ -578,8 +565,32 @@ BOOL hookM(Class _class, SEL _cmd, IMP _new, IMP *_old) {
 #endif
 }
 
+// Processes that must never be hooked. The filter plist matches com.apple.UIKit, so this dylib is also
+// loaded into the Settings app that hosts the preference pane; hooking Security/NSURLSession there
+// destabilises it (and the pane is what writes the preferences we read).
+static BOOL isExcludedProcess(void)
+{
+    NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
+    if (!bundleId) {
+        return NO;
+    }
+    static NSString *const kNeverHook[] = {
+        @"com.apple.TVSettings",
+    };
+    for (size_t i = 0; i < sizeof(kNeverHook) / sizeof(kNeverHook[0]); i++) {
+        if ([bundleId isEqualToString:kNeverHook[i]]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
 __attribute__((constructor)) static void init(int argc, const char **argv)
 {
+    if (isExcludedProcess()) {
+        return;
+    }
+
     // Only hook if the preference file says so
     if (shouldHookFromPreference())
     {
@@ -638,6 +649,7 @@ __attribute__((constructor)) static void init(int argc, const char **argv)
 
             // CocoaSPDY works by getting registered as a NSURLProtocol; block that so the Apps switches back to HTTP as SPDY is tricky to proxy
             Class spdyUrlConnectionProtocolClass = NSClassFromString(@"SPDYURLConnectionProtocol");
+            if (spdyUrlConnectionProtocolClass)
             hookM(object_getClass(spdyUrlConnectionProtocolClass), NSSelectorFromString(@"registerOrigin:"), (IMP) &newRegisterOrigin, (IMP *)&oldRegisterOrigin);
 
             hookM(NSClassFromString(@"NSURLSessionConfiguration"), NSSelectorFromString(@"setprotocolClasses:"), (IMP) &newSetprotocolClasses, (IMP *)&oldSetprotocolClasses);
